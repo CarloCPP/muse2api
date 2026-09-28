@@ -484,22 +484,36 @@ class MuseEngine:
     # ---------------- 附件（生成结果） ----------------
     _ATT_JS = (
         "(function(){"
-        "var atts=[...document.querySelectorAll('" + ATT_SEL + "')];"
-        "return JSON.stringify(atts.map(function(a){"
-        "var v=a.querySelector('video');"
-        "var img=a.querySelector('img');"
-        "var isVid=(a.getAttribute('data-testid')||'').includes('video')||!!v;"
-        "var primary=isVid?(v||img):(img||v);"
-        "return {"
-        "tid:a.getAttribute('data-testid')||'',"
-        "hasVideo:!!v,"
-        "hasImg:!!img,"
-        "src:primary?(primary.currentSrc||primary.src||''):'',"
-        "vSrc:v?(v.currentSrc||v.src||''):'',"
-        "iSrc:img?(img.currentSrc||img.src||''):'',"
-        "w:primary?(primary.videoWidth||primary.naturalWidth||0):0,"
-        "h:primary?(primary.videoHeight||primary.naturalHeight||0):0"
-        "};}));})()"
+        "var list = []; var seen = new Set();"
+        "function addEl(el, tid){"
+        "  if(!el || seen.has(el)) return;"
+        "  seen.add(el);"
+        "  var v = el.querySelector('video') || (el.tagName === 'VIDEO' ? el : null);"
+        "  var img = el.querySelector('img') || (el.tagName === 'IMG' ? el : null);"
+        "  var isVid = (tid || '').includes('video') || !!v;"
+        "  var primary = isVid ? (v || img) : (img || v);"
+        "  var src = primary ? (primary.currentSrc || primary.src || '') : '';"
+        "  if(src){"
+        "    list.push({"
+        "      tid: tid || el.getAttribute('data-testid') || (isVid ? 'video' : 'image'),"
+        "      hasVideo: !!v,"
+        "      hasImg: !!img,"
+        "      src: src,"
+        "      vSrc: v ? (v.currentSrc || v.src || '') : '',"
+        "      iSrc: img ? (img.currentSrc || img.src || '') : '',"
+        "      w: primary ? (primary.videoWidth || primary.naturalWidth || 0) : 0,"
+        "      h: primary ? (primary.videoHeight || primary.naturalHeight || 0) : 0"
+        "    });"
+        "  }"
+        "}"
+        "document.querySelectorAll('[data-testid^=\"hatch-chat-attachment-presentation-\"], [data-testid*=\"attachment\"]').forEach(function(a){ addEl(a, a.getAttribute('data-testid')); });"
+        "document.querySelectorAll('[class*=\"outline-media-protection-border\"]').forEach(function(c){ addEl(c, 'media-wrapper'); });"
+        "document.querySelectorAll('div[class*=\"hatch-agent-bubble-bg\"] img, div[class*=\"hatch-agent-bubble-bg\"] video').forEach(function(m){"
+        "  var s = m.currentSrc || m.src || '';"
+        "  if(s && !s.includes('avatar') && !s.includes('emoji')) addEl(m.parentElement || m, 'agent-media');"
+        "});"
+        "return JSON.stringify(list);"
+        "})()"
     )
 
     def attachments(self) -> list[dict]:
@@ -686,17 +700,22 @@ class MuseEngine:
                 raise MuseGenerationError("账号额度不足")
             if elapsed > 16.0 and ("Still sending" in tail or "Connecting..." in tail):
                 raise MuseGenerationError("云端 VM 连接超时 (Still sending)")
-            # 快速失败：如果助手已经完成了纯文字回复（无 Stop 按钮且无新附件），不再傻等 240 秒
+            # 快速失败：如果助手已经完成了纯文字回复（无 Stop 按钮且无新附件），且并非正在生成媒体的报告
             cur_cnt = st.get("cnt") or 0
             cur_txt = st.get("txt") or ""
             has_stop = bool(st.get("stop"))
             if cur_cnt > base_agent_cnt and cur_txt and not has_stop and len(atts) <= base_att_cnt:
-                if cur_txt == last_txt:
-                    txt_stable += 1
+                # 检查是否包含媒体文件生成关键词（如 .webp, .png, .mp4, imagine_media 等），若是则说明正在产出媒体，绝不能误判为纯文本拒答
+                is_media_report = bool(re.search(r"\.(?:webp|png|jpe?g|mp4|webm)|imagine_media|deliverable|generated\s+.*image|verified\s+generated|artifact", cur_txt, re.I))
+                if not is_media_report:
+                    if cur_txt == last_txt:
+                        txt_stable += 1
+                    else:
+                        last_txt, txt_stable = cur_txt, 0
+                    if txt_stable >= 15 and elapsed > 8.0:
+                        raise MuseGenerationError(f"模型未生成媒体，仅返回文本: {cur_txt[:120]}")
                 else:
-                    last_txt, txt_stable = cur_txt, 0
-                if txt_stable >= 6 and elapsed > 6.0:
-                    raise MuseGenerationError(f"模型未生成媒体，仅返回文本: {cur_txt[:120]}")
+                    txt_stable = 0
             else:
                 txt_stable = 0
         return None
@@ -706,7 +725,7 @@ class MuseEngine:
     (async function(src, expect){
       try{
         var u = src;
-        var a = [...document.querySelectorAll('%s')].pop();
+        var a = [...document.querySelectorAll('%s, [class*="outline-media-protection-border"], div[class*="hatch-agent-bubble-bg"]')].pop();
         if(expect === 'video'){
           var v = a ? a.querySelector('video') : document.querySelector('video');
           if (v && (v.currentSrc || v.src)) {

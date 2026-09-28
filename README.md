@@ -97,6 +97,21 @@
    sudo systemctl enable --now muse2api
    ```
 
+4. **Nginx 反向代理配置（重要：防止 502 超时与流式卡顿）**：
+   如使用 Nginx / 宝塔 / 1Panel 反代，务必将 `proxy_read_timeout` 调大至 `600s` 并关闭 `proxy_buffering`（详见 `deploy/nginx.example.conf`）：
+   ```nginx
+   location / {
+       proxy_pass http://127.0.0.1:18610;
+       proxy_read_timeout 600s;      # 避免生图/视频耗时较长被 Nginx 报 502 Bad Gateway
+       proxy_send_timeout 600s;
+       proxy_buffering off;          # 保证 SSE 对话流式打字机 0 延迟吐字
+       client_max_body_size 64M;     # 支持参考图大文件上传
+       proxy_set_header Host $host;
+       proxy_set_header X-Real-IP $remote_addr;
+       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+   }
+   ```
+
 ---
 
 ## 🧩 Chrome 扩展导号（零门槛）
