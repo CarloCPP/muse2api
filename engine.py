@@ -488,12 +488,14 @@ class MuseEngine:
         "function addEl(el, tid){"
         "  if(!el || seen.has(el)) return;"
         "  seen.add(el);"
+        "  if(el.closest('form, [class*=chat-user-bubble], [class*=\"group/msg\"]')) return;"
         "  var v = el.querySelector('video') || (el.tagName === 'VIDEO' ? el : null);"
         "  var img = el.querySelector('img') || (el.tagName === 'IMG' ? el : null);"
         "  var isVid = (tid || '').includes('video') || !!v;"
         "  var primary = isVid ? (v || img) : (img || v);"
         "  var src = primary ? (primary.currentSrc || primary.src || '') : '';"
-        "  if(src){"
+        "  if(src && !seen.has(src)){"
+        "    seen.add(src);"
         "    list.push({"
         "      tid: tid || el.getAttribute('data-testid') || (isVid ? 'video' : 'image'),"
         "      hasVideo: !!v,"
@@ -506,8 +508,7 @@ class MuseEngine:
         "    });"
         "  }"
         "}"
-        "document.querySelectorAll('[data-testid^=\"hatch-chat-attachment-presentation-\"], [data-testid*=\"attachment\"]').forEach(function(a){ addEl(a, a.getAttribute('data-testid')); });"
-        "document.querySelectorAll('[class*=\"outline-media-protection-border\"]').forEach(function(c){ addEl(c, 'media-wrapper'); });"
+        "document.querySelectorAll('[data-testid^=\"hatch-chat-attachment-presentation-\"]').forEach(function(a){ addEl(a, a.getAttribute('data-testid')); });"
         "document.querySelectorAll('div[class*=\"hatch-agent-bubble-bg\"] img, div[class*=\"hatch-agent-bubble-bg\"] video').forEach(function(m){"
         "  var s = m.currentSrc || m.src || '';"
         "  if(s && !s.includes('avatar') && !s.includes('emoji')) addEl(m.parentElement || m, 'agent-media');"
@@ -643,7 +644,8 @@ class MuseEngine:
 
     def _wait_attachment(self, baseline_src: str, timeout: int, expect: str,
                          on_progress=None, base_agent_cnt: int = 0,
-                         base_att_cnt: int = 0, stop_event=None) -> dict | None:
+                         base_att_cnt: int = 0, stop_event=None, baseline_sources=None) -> dict | None:
+        baseline_sources = set(baseline_sources or ()) | {baseline_src}
         deadline = time.time() + timeout
         t_start = time.time()
         stable_src, stable_n = "", 0
@@ -667,7 +669,7 @@ class MuseEngine:
                 else:
                     want = ("image" in tid) or (not has_video)
                 check_src = v_src if (expect == "video" and v_src) else src
-                if check_src and (check_src != baseline_src or len(atts) > base_att_cnt) and want:
+                if check_src and check_src not in baseline_sources and want:
                     if w > 0 and h > 0:
                         return att
                     if check_src == stable_src:
@@ -725,24 +727,9 @@ class MuseEngine:
     (async function(src, expect){
       try{
         var u = src;
-        var a = [...document.querySelectorAll('%s, [class*="outline-media-protection-border"], div[class*="hatch-agent-bubble-bg"]')].pop();
-        if(expect === 'video'){
-          var v = a ? a.querySelector('video') : document.querySelector('video');
-          if (v && (v.currentSrc || v.src)) {
-            u = v.currentSrc || v.src;
-          }
-        } else {
-          var img = a ? a.querySelector('img') : null;
-          if (img && (img.currentSrc || img.src)) {
-            u = img.currentSrc || img.src;
-          }
-        }
-        if(!u && a){
-          var m = (expect === 'video') ? (a.querySelector('video') || a.querySelector('img')) : (a.querySelector('img') || a.querySelector('video'));
-          if(m) u = m.currentSrc || m.src || '';
-        }
         if(!u) return JSON.stringify({ok:false,err:'no-media-src'});
         var r = await fetch(u);
+        if(!r.ok) return JSON.stringify({ok:false,err:'media-http-'+r.status});
         var b = await r.blob();
         var ab = await b.arrayBuffer();
         var bytes = new Uint8Array(ab);
@@ -755,7 +742,7 @@ class MuseEngine:
         return JSON.stringify({ok:false, err:String(e)});
       }
     })(%s, %s)
-    """ % (ATT_SEL, "%s", "%s")
+    """
 
     # ---------------- 文本 / 代码对话 ----------------
     _AGENT_TEXT_JS = (
@@ -909,19 +896,21 @@ class MuseEngine:
         raise MuseGenerationError(f"未能取回生成结果: {last}")
 
     # ---------------- 下载兜底 ----------------
-    def _download_fallback(self, timeout: int = 180) -> str | None:
+    def _download_fallback(self, src: str, timeout: int = 180) -> str | None:
         before = set(os.listdir(self.cfg.download_dir))
-        clicked = self.page.js(
-            "(function(){var a=[...document.querySelectorAll('" + ATT_SEL + "')].pop();"
-            "var node=a;"
-            "for(var i=0;i<12&&node;i++){"
-            "var b=[...node.querySelectorAll('button,[role=button]')]"
-            ".filter(x=>/下载|保存|download/i.test(x.getAttribute('aria-label')||''));"
-            "if(b.length){b[b.length-1].click();return 'ok';}node=node.parentElement;}"
-            "var all=[...document.querySelectorAll('button,[role=button]')]"
-            ".filter(x=>/下载|保存|download/i.test(x.getAttribute('aria-label')||''));"
-            "if(all.length){all[all.length-1].click();return 'global';}"
-            "return 'none';})()")
+        # ponytail: fail closed when the selected result has no local download;
+        # never click an unrelated/global button that can return the upload.
+        clicked = self.page.js("""(function(src){
+            var media=[...document.querySelectorAll('img,video')]
+                .find(m=>(m.currentSrc||m.src||'')===src);
+            var node=media && media.closest('[data-testid^="hatch-chat-attachment-presentation-"]');
+            if(!node) return 'none';
+            node=node.closest('[class*="group/widget-presentation"]')||node;
+            var b=[...node.querySelectorAll('button,[role=button]')]
+                .find(x=>/下载|保存|download/i.test(x.getAttribute('aria-label')||''));
+            if(!b) return 'none';
+            b.click();return 'ok';
+        })(%s)""" % json.dumps(src))
         if clicked == "none":
             return None
         deadline = time.time() + timeout
@@ -992,7 +981,7 @@ class MuseEngine:
             return
         b64, mime = self._normalize_image(image_data)
         if not b64:
-            return
+            raise MuseGenerationError("参考图读取失败，已停止生成")
 
         self._clear_attachments()
 
@@ -1026,23 +1015,24 @@ class MuseEngine:
             raw_res = self.page.js(_INJECT_JS % (json.dumps(b64), json.dumps(mime)))
             res_obj = json.loads(raw_res) if isinstance(raw_res, str) else raw_res
             if not res_obj.get("ok"):
-                log.warning("附加参考图失败: %s", res_obj.get("err"))
+                raise MuseGenerationError("附加参考图失败，已停止生成")
         except Exception as e:
-            log.warning("附加参考图解析失败: %s", e)
+            raise MuseGenerationError("附加参考图失败，已停止生成") from e
 
-        # 等待缩略图和 Remove attachment 按钮出现，最长等待 4 秒
-        deadline = time.time() + 4.0
+        # 等待输入框附件确认；历史图片不能证明本次上传成功
+        deadline = time.time() + 15.0
         while time.time() < deadline:
             has_attached = self.page.js(
                 """(function(){
                 var hasBtn = document.querySelector('button[aria-label*="Remove attachment" i]');
-                var hasImg = document.querySelector('form img, [class*="object-cover"], img[alt*="reference"]');
-                return Boolean(hasBtn || hasImg);
+                return Boolean(hasBtn);
                 })()"""
             )
             if has_attached:
                 break
             time.sleep(0.3)
+        else:
+            raise MuseGenerationError("参考图上传未确认，已停止生成")
         time.sleep(0.5)
     # ---------------- 主流程 ----------------
     def generate(self, cookies: dict, prompt: str, expect: str = "image",
@@ -1052,19 +1042,21 @@ class MuseEngine:
         self.ensure_page(cookies, expires, account_id=account_id)
         self.reset_thread(for_chat=False)
         self._scroll_bottom()
-        atts_before = self.attachments()
-        base = atts_before[-1] if atts_before else {}
-        baseline_src = base.get("src") or ""
-        base_agent_cnt = self._agent_count()
         if reference_image:
             self._attach_image(reference_image)
         else:
             self._clear_attachments()
-        self._send(prompt)
+        atts_before = self.attachments()
+        baseline_sources = {a.get(k) for a in atts_before for k in ("src", "vSrc", "iSrc") if a.get(k)}
+        base = atts_before[-1] if atts_before else {}
+        baseline_src = base.get("src") or ""
+        base_agent_cnt = self._agent_count()
+        if self._send(prompt) not in ("clicked", "enter-sent"):
+            raise MuseGenerationError("提示词发送未确认，已停止生成")
         att = self._wait_attachment(
             baseline_src, timeout, expect, on_progress=on_progress,
             base_agent_cnt=base_agent_cnt, base_att_cnt=len(atts_before),
-            stop_event=stop_event
+            stop_event=stop_event, baseline_sources=baseline_sources
         )
         if not att:
             self._debug_dump("no-attachment")
@@ -1072,8 +1064,9 @@ class MuseEngine:
 
         os.makedirs(self.cfg.media_dir, exist_ok=True)
         data = mime = url = None
+        selected_src = (att.get("vSrc") if expect == "video" else None) or att.get("src") or ""
         try:
-            data, mime, url = self.extract_bytes(att.get("src") or "", expect=expect)
+            data, mime, url = self.extract_bytes(selected_src, expect=expect)
         except Exception:  # noqa: BLE001
             self._debug_dump("extract-fail")
 
@@ -1088,7 +1081,7 @@ class MuseEngine:
                     "via": "blob", "attachment": att.get("tid"),
                     "w": att.get("w"), "h": att.get("h")}
 
-        path = self._download_fallback()
+        path = self._download_fallback(selected_src)
         if not path:
             raise MuseGenerationError("已生成但未能取回文件")
         ext = os.path.splitext(path)[1].lower() or ".bin"
