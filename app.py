@@ -28,6 +28,7 @@ from typing import Any
 import asyncio
 import base64
 import io
+import hashlib
 import json
 import logging
 import os
@@ -56,7 +57,7 @@ if not log.handlers:
     log.addHandler(_h)
 
 CFG.ensure_dirs()
-app = FastAPI(title="muse2api", version="1.5.1")
+app = FastAPI(title="muse2api", version="1.5.2")
 
 # Cookie 助手脚本从 muse.ai 页面发起导入请求，需要放行该来源；
 # 浏览器扩展从 chrome-extension:// 发起，也一并放行。
@@ -77,6 +78,7 @@ app.add_middleware(CORSMiddleware,
 store = Store(CFG)
 engine = MuseEngine(CFG)
 GEN_LOCK = threading.Lock()
+IMAGE_TASK_LOCK = threading.Lock()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -300,11 +302,12 @@ class ImageRequest(BaseModel):
     size: str | None = None
     aspect_ratio: str | None = None
     response_format: str = "url"      # url | b64_json
-    timeout: int | None = None
+    timeout: int | None = Field(default=None, ge=1, le=600)
     extra: str | None = None
     image: Any = None
     images: list | None = None
     reference_image: str | None = None
+    async_: bool = Field(False, alias="async")
 
 
 class VideoRequest(BaseModel):
@@ -736,6 +739,20 @@ def _pos(v) -> bool:
 def _run_generation(prompt: str, kind: str, timeout: int,
                     account_id: str | None = None, on_progress=None,
                     reference_image: str | None = None) -> tuple[dict, str | None]:
+    # Browser ownership covers account selection, retry and cleanup, not just generate().
+    deadline = time.monotonic() + max(1, timeout)
+    if not GEN_LOCK.acquire(timeout=max(1, timeout)):
+        raise MuseGenerationError("等待浏览器队列超时，请稍后重试")
+    try:
+        return _run_generation_locked(prompt, kind, timeout, account_id,
+                                      on_progress, reference_image, deadline=deadline)
+    finally:
+        GEN_LOCK.release()
+
+
+def _run_generation_locked(prompt: str, kind: str, timeout: int,
+                    account_id: str | None = None, on_progress=None,
+                    reference_image: str | None = None, deadline=None) -> tuple[dict, str | None]:
     acc = store.get_account(account_id) if account_id else None
     if acc and not acc.get("enabled", True):
         acc = None
@@ -747,6 +764,8 @@ def _run_generation(prompt: str, kind: str, timeout: int,
     last_exc = None
     cur_acc = acc
     for attempt in range(2):
+        if deadline is not None and time.monotonic() >= deadline:
+            raise MuseGenerationError("任务总等待时限已到，停止重试")
         if attempt > 0:
             if last_exc and "未产出媒体附件，仅返回了文本回复" in str(last_exc):
                 break
@@ -759,15 +778,17 @@ def _run_generation(prompt: str, kind: str, timeout: int,
             refreshed = _renew_and_persist(cur_acc["id"], wake_vm=True, force=(attempt > 0))
             if refreshed:
                 cur_acc = refreshed
-            with GEN_LOCK:
-                engine.start()
-                res = engine.generate(cur_acc["cookies"], prompt, expect=kind,
-                                      timeout=timeout, expires=cur_acc.get("cookies_exp"),
-                                      account_id=cur_acc["id"], on_progress=on_progress,
-                                      reference_image=reference_image)
-                store.mark(cur_acc["id"], True, "")
-                _sync_cookies(cur_acc["id"])
-                return res, cur_acc["id"]
+            engine.start()
+            remaining = int(deadline - time.monotonic()) if deadline is not None else timeout
+            if remaining <= 0:
+                raise MuseGenerationError("任务总等待时限已到，停止重试")
+            res = engine.generate(cur_acc["cookies"], prompt, expect=kind,
+                                  timeout=remaining, expires=cur_acc.get("cookies_exp"),
+                                  account_id=cur_acc["id"], on_progress=on_progress,
+                                  reference_image=reference_image)
+            store.mark(cur_acc["id"], True, "")
+            _sync_cookies(cur_acc["id"])
+            return res, cur_acc["id"]
         except MuseAuthError as exc:
             last_exc = exc
             store.mark(cur_acc["id"], False, str(exc))
@@ -805,6 +826,97 @@ def models(_=Depends(auth)):
 
 
 # ------------------------- 生图 -------------------------
+def _image_response(req: ImageRequest, res: dict) -> dict:
+    item = {"revised_prompt": req.prompt, "url": media_url(res["filename"]),
+            "size": req.size or "auto", "kind": res["kind"], "bytes": res["size"]}
+    if req.response_format == "b64_json":
+        fpath = res.get("path") or os.path.join(CFG.media_dir, res["filename"])
+        with open(fpath, "rb") as f:
+            item["b64_json"] = base64.b64encode(f.read()).decode()
+        item.pop("url", None)
+    return {"created": int(time.time()), "data": [item]}
+
+
+def _queue_image(req: ImageRequest, prompt: str, reference_image: str | None,
+                 idempotency_key: str | None = None):
+    """Opt-in polling avoids reverse-proxy timeouts; no generation is repeated by polling."""
+    if idempotency_key and len(idempotency_key) > 256:
+        raise HTTPException(400, "Idempotency-Key too long")
+    key_hash = hashlib.sha256(idempotency_key.encode()).hexdigest() if idempotency_key else None
+    request_hash = hashlib.sha256(json.dumps(
+        {"request": req.model_dump(by_alias=True), "reference": reference_image},
+        sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    with IMAGE_TASK_LOCK:
+        tasks = list(store.tasks.values())
+        if key_hash:
+            for existing in tasks:
+                if existing.get("image_request_key") == key_hash:
+                    if existing.get("image_request_hash") != request_hash:
+                        raise HTTPException(409, "Idempotency-Key reused with different request")
+                    return JSONResponse(status_code=202, content={
+                        "id": existing["id"], "task_id": existing["id"],
+                        "object": "image.task", "status": existing["status"],
+                        "progress": existing.get("progress", 0),
+                        "created_at": existing["created_at"]})
+        # ponytail: one Chromium worker; cap admission instead of adding a broker.
+        if sum(t.get("kind") == "image" and t.get("status") in ("queued", "processing")
+               for t in tasks) >= 8:
+            raise HTTPException(429, "Image queue is full; retry later")
+        task = store.create_task("image", req.prompt)
+        tid = task["id"]
+        store.update_task(tid, api_prompt=prompt, size=req.size,
+                          response_format=req.response_format, progress=0,
+                          image_request_key=key_hash, image_request_hash=request_hash)
+
+    def worker():
+        t0 = time.time()
+        store.update_task(tid, status="processing", progress=5)
+        try:
+            res, acc_id = _run_generation(
+                prompt, "image", req.timeout or CFG.image_timeout,
+                reference_image=reference_image,
+                on_progress=lambda p: store.update_task(tid, progress=p))
+            # Store only media metadata, not large base64 payloads or reference credentials.
+            store.update_task(tid, status="completed", progress=100, account=acc_id,
+                              elapsed=round(time.time() - t0, 1),
+                              url=media_url(res["filename"]),
+                              result={**{k: res[k] for k in ("filename", "size", "kind")},
+                                      "url": media_url(res["filename"])})
+        except Exception as exc:  # noqa: BLE001
+            store.update_task(tid, status="failed", error=str(exc),
+                              elapsed=round(time.time() - t0, 1))
+
+    threading.Thread(target=worker, daemon=True).start()
+    return JSONResponse(status_code=202, content={
+        "id": tid, "task_id": tid, "object": "image.task", "status": "queued",
+        "progress": 0, "created_at": task["created_at"]})
+
+
+@app.post("/v1/images/tasks")
+def create_image_task(req: ImageRequest,
+                      idempotency_key: str | None = Header(default=None), _=Depends(auth)):
+    ref_img = req.reference_image or req.image
+    if isinstance(ref_img, dict):
+        ref_img = ref_img.get("url") or ref_img.get("b64_json")
+    if not ref_img and req.images:
+        first = req.images[0]
+        ref_img = first.get("image_url") or first.get("url") if isinstance(first, dict) else first
+    return _queue_image(req, build_image_prompt(req), ref_img, idempotency_key)
+
+
+@app.get("/v1/images/tasks/{task_id}")
+def get_image_task(task_id: str, _=Depends(auth)):
+    task = store.get_task(task_id)
+    if not task or task.get("kind") != "image":
+        raise HTTPException(404, "image task 不存在")
+    out = dict(task)
+    if out.get("status") == "completed":
+        req = ImageRequest(prompt=out["prompt"], size=out.get("size"),
+                           response_format=out.get("response_format") or "url")
+        out.update(_image_response(req, out["result"]))
+    return out
+
+
 @app.post("/v1/images/generations")
 async def images_generations(req: ImageRequest, _=Depends(auth)):
     ref_img = req.reference_image or req.image
@@ -816,20 +928,15 @@ async def images_generations(req: ImageRequest, _=Depends(auth)):
 
     prompt = build_image_prompt(req)
     timeout = req.timeout or CFG.image_timeout
+    if req.async_:
+        return _queue_image(req, prompt, ref_img)
     try:
         res, _acc = await asyncio.to_thread(_run_generation, prompt, "image", timeout, reference_image=ref_img)
     except MuseAuthError as exc:
         raise HTTPException(401, str(exc)) from exc
     except MuseGenerationError as exc:
         raise HTTPException(502, str(exc)) from exc
-    item = {"revised_prompt": req.prompt, "url": media_url(res["filename"]),
-            "size": req.size or "auto", "kind": res["kind"], "bytes": res["size"]}
-    if req.response_format == "b64_json":
-        fpath = res.get("path") or os.path.join(CFG.media_dir, res["filename"])
-        with open(fpath, "rb") as f:
-            item["b64_json"] = base64.b64encode(f.read()).decode()
-        item.pop("url", None)
-    return {"created": int(time.time()), "data": [item]}
+    return _image_response(req, res)
 
 
 @app.post("/v1/images/edits")
@@ -843,9 +950,11 @@ async def images_edits(request: Request, _=Depends(auth)):
     response_format = "url"
     timeout = None
     ref_image_data = None
+    async_mode = False
 
     if "multipart/form-data" in content_type:
         form = await request.form()
+        async_mode = form.get("async", False)
         prompt = form.get("prompt") or ""
         model = form.get("model") or "muse-image"
         size = form.get("size")
@@ -866,6 +975,7 @@ async def images_edits(request: Request, _=Depends(auth)):
             ref_image_data = img_field
     else:
         body = await request.json()
+        async_mode = body.get("async", False)
         prompt = body.get("prompt") or ""
         model = body.get("model") or "muse-image"
         size = body.get("size")
@@ -896,10 +1006,13 @@ async def images_edits(request: Request, _=Depends(auth)):
         aspect_ratio=aspect_ratio,
         response_format=response_format,
         timeout=timeout,
-        reference_image=ref_image_data
+        reference_image=ref_image_data,
+        **{"async": async_mode}
     )
     full_prompt = build_image_prompt(req_obj)
     gen_timeout = timeout or CFG.image_timeout
+    if req_obj.async_:
+        return _queue_image(req_obj, full_prompt, ref_image_data)
     try:
         res, _acc = await asyncio.to_thread(_run_generation, full_prompt, "image", gen_timeout, reference_image=ref_image_data)
     except MuseAuthError as exc:
@@ -907,14 +1020,7 @@ async def images_edits(request: Request, _=Depends(auth)):
     except MuseGenerationError as exc:
         raise HTTPException(502, str(exc)) from exc
 
-    item = {"revised_prompt": prompt, "url": media_url(res["filename"]),
-            "size": size or "auto", "kind": res["kind"], "bytes": res["size"]}
-    if response_format == "b64_json":
-        fpath = res.get("path") or os.path.join(CFG.media_dir, res["filename"])
-        with open(fpath, "rb") as f:
-            item["b64_json"] = base64.b64encode(f.read()).decode()
-        item.pop("url", None)
-    return {"created": int(time.time()), "data": [item]}
+    return _image_response(req_obj, res)
 
 
 # ------------------------- 生视频（异步任务） -------------------------
@@ -2108,6 +2214,9 @@ async def admin_repo_push(payload: dict = Body(default={}), _=Depends(auth)):
 
 @app.on_event("startup")
 async def _startup():
+    for task in list(store.tasks.values()):
+        if task.get("kind") == "image" and task.get("status") in ("queued", "processing"):
+            store.update_task(task["id"], status="failed", error="服务重启中断了任务，请重新提交")
     if not CFG.api_key:
         import secrets
         new_key = "m2a_" + secrets.token_hex(24)

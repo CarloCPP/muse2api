@@ -700,8 +700,8 @@ class MuseEngine:
             tail = st.get("tail") or ""
             if re.search(r"额度不足|积分不足|out of credits|达到上限|token limit", tail):
                 raise MuseGenerationError("账号额度不足")
-            if elapsed > 16.0 and ("Still sending" in tail or "Connecting..." in tail):
-                raise MuseGenerationError("云端 VM 连接超时 (Still sending)")
+            # Sidebar/stale connection text does not prove this generation failed.
+            # The caller's generation deadline remains the bounded timeout.
             # 快速失败：如果助手已经完成了纯文字回复（无 Stop 按钮且无新附件），且并非正在生成媒体的报告
             cur_cnt = st.get("cnt") or 0
             cur_txt = st.get("txt") or ""

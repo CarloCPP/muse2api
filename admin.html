@@ -1229,11 +1229,26 @@ async function runImage(){
   if (!prompt) return toast('请输入提示词', 'warn');
   btn.disabled = true; btn.innerHTML = '<span class="spin"></span>生成中…';
   box.className = 'result show';
-  box.innerHTML = '<span class="spin"></span>正在驱动 muse.ai 生成图片，通常 10–30 秒…';
+  box.innerHTML = '<span class="spin"></span>正在提交图片任务，生成期间会持续查询状态…';
   const t0 = Date.now();
   try{
-    const r = await api('/v1/images/generations', {method:'POST',
-      body: JSON.stringify({prompt, size: $('imgSize').value})});
+    let r = await api('/v1/images/tasks', {method:'POST',
+      body: JSON.stringify({prompt, size: $('imgSize').value, timeout:600})});
+    const taskId = r.id;
+    const deadline = Date.now() + 15 * 60 * 1000;
+    let failures = 0;
+    while (r.status !== 'completed') {
+      if (Date.now() >= deadline) throw new Error('等待超过 15 分钟，请在任务记录查看结果，勿重复提交');
+      if (r.status === 'failed') throw new Error(r.error || '图片生成失败');
+      box.textContent = `任务 ${taskId} · ${r.status} · 已等待 ${Math.floor((Date.now()-t0)/1000)} 秒`;
+      await new Promise(resolve => setTimeout(resolve, 3000));
+      try {
+        r = await api('/v1/images/tasks/' + encodeURIComponent(taskId));
+        failures = 0;
+      } catch (e) {
+        if (++failures >= 6) throw new Error('状态查询暂时失败，请在任务记录查看，勿重复提交');
+      }
+    }
     const it = r.data[0];
     box.innerHTML = `<b style="color:var(--ok)">✓ 生成成功</b>
       <span class="mono" style="color:var(--muted);margin-left:10px">${((Date.now()-t0)/1000).toFixed(1)}s · ${fmtBytes(it.bytes)}</span>

@@ -261,3 +261,29 @@ python tests/test_media_selection.py
 如浏览器不在 PATH，可设置 `MUSE2API_CHROMIUM` 为可执行文件路径。
 覆盖上传预览排除、结果去重、历史附件排除、精确来源下载、视频来源保持、
 禁止全局下载回退，以及参考图读取失败时中止。最终图片编辑效果仍需通过真实接口验收。
+
+
+## v1.5.2：反向代理/CDN 后的长耗时生图
+
+同步 OpenAI 图片接口仍保留兼容，但 CDN/客户端可能在生成结束前截断长请求。
+生产客户端应使用短提交 + 轮询，而不是延长 HTTP 超时后重复生成：
+
+1. `POST /v1/images/tasks`：JSON 与 `/v1/images/generations` 相同，可用 `reference_image` 传入图生图参考；建议添加稳定的 `Idempotency-Key` 请求头。
+2. 接收 HTTP 202 和 `id`，每 3 秒调用 `GET /v1/images/tasks/{id}`。
+3. `status=completed` 时读取 `url` 或 `data[0]`；`status=failed` 时显示 `error`。查询失败只重试查询，不要重新 POST 生图。
+4. 相同幂等键及相同输入返回原任务；同键不同输入返回 409；队列满返回 429。一个进程共享一个浏览器，最多接收 8 个未结束图片任务。
+
+原 `/v1/images/generations` JSON 和 `/v1/images/edits` JSON/multipart 也可传 `async=true`，切换到同一异步处理。默认同步行为不变。
+`timeout` 为排队及生成等待预算（1–600 秒），浏览器初始化与取回另有各自超时；客户端应继续轮询任务终态。
+任务元数据持久化；进程重启时尚未完成的图片任务标记失败，不会悄悄再次生成。
+管理页图片接口测试也已改为任务轮询。
+
+回归检查（不消耗真实生成额度）：
+
+```bash
+python tests/test_async_images.py
+python tests/test_vm_wait.py engine.py --assert
+```
+
+修复共享浏览器异常处理在解锁后重置其他任务的竞争；不再把页面侧栏残留的
+`Connecting...` / `Still sending` 文本当作当前生图在 16 秒内失败的证据。
