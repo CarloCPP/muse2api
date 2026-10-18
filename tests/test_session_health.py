@@ -113,6 +113,15 @@ def check(root, home, observe):
                 error_name = type(exc).__name__
         expect(error_name == want, 'page load failure misclassified')
         print('page', body, error_name)
+
+    # 验证缺少 hatch_gw 时，账号依然判定 essential_ok 并支持正常入库与预续签
+    no_gw_cookies = {'hatch_sess': 'fixture_sess', 'hatch_vml': 'fixture_vml', 'hatch_native_auth_device': 'fixture_dev'}
+    a_no_gw = app.store.add_account(no_gw_cookies, cookies_exp={'hatch_vml': 1900012345})
+    listed = next(acc for acc in app.store.list_accounts() if acc['id'] == a_no_gw['id'])
+    expect(listed['essential_ok'] is True, 'account without hatch_gw must be essential_ok')
+    expect(app.store.is_essential_missing(no_gw_cookies) == [], 'account without hatch_gw must not miss essential cookies') if hasattr(app.store, 'is_essential_missing') else None
+    print('no_gw_account_check', 'essential_ok', listed['essential_ok'])
+
     print(('OBSERVED' if observe else 'PASS'), checks, 'checks; no live accounts/network/browser')
 
 
