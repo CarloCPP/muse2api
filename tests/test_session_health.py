@@ -122,6 +122,15 @@ def check(root, home, observe):
     expect(app.store.is_essential_missing(no_gw_cookies) == [], 'account without hatch_gw must not miss essential cookies') if hasattr(app.store, 'is_essential_missing') else None
     print('no_gw_account_check', 'essential_ok', listed['essential_ok'])
 
+    # 验证缺少真正核心凭证（如缺 hatch_sess 或 hatch_vml）的无效 Cookie 必须被标记 essential_ok=False，且 API 提示缺少核心项
+    invalid_cookies = {'foo': 'bar', 'hatch_native_auth_device': 'device_only'}
+    a_invalid = app.store.add_account(invalid_cookies)
+    listed_invalid = next(acc for acc in app.store.list_accounts() if acc['id'] == a_invalid['id'])
+    expect(listed_invalid['essential_ok'] is False, 'account without hatch_sess and hatch_vml must NOT be essential_ok')
+    missing_items = [n for n in app.ESSENTIAL_COOKIES if n not in invalid_cookies]
+    expect('hatch_sess' in missing_items and 'hatch_vml' in missing_items, 'missing essential list must capture core tokens')
+    print('invalid_cookie_check', 'essential_ok', listed_invalid['essential_ok'], 'missing', missing_items)
+
     print(('OBSERVED' if observe else 'PASS'), checks, 'checks; no live accounts/network/browser')
 
 
